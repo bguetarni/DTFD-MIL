@@ -1,15 +1,8 @@
-import argparse
-import json
-import os
+import argparse, json, os, glob, math, pickle, random
 import pandas
-import glob
-import math
-import pickle
-import random
 import numpy as np
 import tqdm
-from PIL import Image
-from sklearn import metrics
+import sklearn
 
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
@@ -23,35 +16,47 @@ from utils import get_cam_1d
 from Model.network import    Classifier_1fc, DimReduction
 from utils import eval_metric
 
-def metrics_fn(Y_true, Y_pred, class_idx):
+def metrics_fn(args, Y_true, Y_pred):
     """
+    args : script arguments
     Y_true (n_samples, n_classes) : array of probabilities prediction
     Y_pred (n_samples, n_classes) : array of true class as one-hot index
-    class_idx : dict of class index
     """
 
     # cross-entropy error
-    error = metrics.log_loss(Y_true, Y_pred)
+    error = sklearn.metrics.log_loss(Y_true, Y_pred)
+
+    # ROC AUC (per class)
+    auc = dict()
+    for i in range(Y_true.shape[1]):
+        # select class one-hot values
+        ytrue = Y_true[:,i]
+
+        # transform probabilities from [0.5,1] to [0,1]
+        # probabilities in [0,0.5] are clipped to 0
+        ypred = np.clip(Y_pred[:,i], 0.5, 1) * 2 - 1
+        auc_score = sklearn.metrics.roc_auc_score(ytrue, ypred)
+        auc.update({i: auc_score})
     
     # convert to one-hot index
     Y_true_label = np.argmax(Y_true, axis=-1)
     Y_pred_label = np.argmax(Y_pred, axis=-1)
     
     # global metrics
-    TP = metrics.accuracy_score(Y_true_label, Y_pred_label, normalize=False)
-    accuracy = metrics.accuracy_score(Y_true_label, Y_pred_label)
-    micro_Fscore = metrics.f1_score(Y_true_label, Y_pred_label, average='micro')
-    macro_Fscore = metrics.f1_score(Y_true_label, Y_pred_label, average='macro')
-    weighted_Fscore = metrics.f1_score(Y_true_label, Y_pred_label, average='weighted')
+    TP = sklearn.metrics.accuracy_score(Y_true_label, Y_pred_label, normalize=False)
+    accuracy = sklearn.metrics.accuracy_score(Y_true_label, Y_pred_label)
+    micro_Fscore = sklearn.metrics.f1_score(Y_true_label, Y_pred_label, average='micro')
+    macro_Fscore = sklearn.metrics.f1_score(Y_true_label, Y_pred_label, average='macro')
+    weighted_Fscore = sklearn.metrics.f1_score(Y_true_label, Y_pred_label, average='weighted')
 
     # compile metrics in dict
     metrics_ = dict(error=error, TP=TP, accuracy=accuracy, micro_Fscore=micro_Fscore, macro_Fscore=macro_Fscore, weighted_Fscore=weighted_Fscore)
     
     # confusion matrix for each class
-    multiclass_cm = metrics.multilabel_confusion_matrix(Y_true_label, Y_pred_label)
+    multiclass_cm = sklearn.metrics.multilabel_confusion_matrix(Y_true_label, Y_pred_label)
 
     # computes binary metrics for each class (one versus all)
-    for k, i in class_idx.items():
+    for k, i in TRAIN_PARAMS['class_to_label'][args.dataset].items():
         
         # statistics from sklearn confusion matrix
         tn, fp, fn, tp = multiclass_cm[i].ravel()
@@ -63,6 +68,7 @@ def metrics_fn(Y_true, Y_pred, class_idx):
         fscore = 0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
         
         metrics_.update({
+            "{}_auc".format(k): auc[i],
             "{}_precision".format(k): precision,
             "{}_recall".format(k): recall,
             "{}_fscore".format(k): fscore,
@@ -72,10 +78,37 @@ def metrics_fn(Y_true, Y_pred, class_idx):
     return metrics_
 
 
+
+def load_data(args):
+
+    if args.dataset in ["chulille", "dlbclmorph"]:
+        labels = pandas.read_csv(args.labels).set_index('patient_id')['label'].to_dict()
+
+    data = []
+    if args.dataset == "chulille":
+        pass #TODO
+    elif  args.dataset == "dlbclmorph":
+        for fold in os.listdir(args.mDATA_dir_test0):
+            if fold != args.fold:
+                continue
+            for p in os.listdir(os.path.join(args.mDATA_dir_test0, fold)):
+                y = labels[int(p)]
+                patches = glob.glob(os.path.join(args.mDATA_dir_test0, fold, p, '*.pt'))
+                data.append((patches, TRAIN_PARAMS['class_to_label'][args.dataset][y]))
+    elif  args.dataset == "bci":
+        for img_name in os.listdir(os.path.join(args.mDATA_dir_test0, "test")):
+            y = img_name.split('_')[-1]
+            patches = glob.glob(os.path.join(args.mDATA_dir_test0, "test", img_name, '*.pt'))
+            data.append((patches, TRAIN_PARAMS['class_to_label'][args.dataset][y]))
+    
+    return data
+
+
 def main(params):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    labels = pandas.read_csv(params.labels).set_index('patient_id')['label'].to_dict()
+    if params.dataset in ["chulille", "dlbclmorph"]:
+        labels = pandas.read_csv(params.labels).set_index('patient_id')['label'].to_dict()
 
     # model
     in_chn = 1024
@@ -97,9 +130,10 @@ def main(params):
 
     instance_per_group = params.total_instance // params.numGroup
 
-    result_per_patient = {}
-    for p in tqdm.tqdm(os.listdir(params.mDATA_dir_test0), ncols=100):
-        patches = glob.glob(os.path.join(params.mDATA_dir_test0, p, "*", "*.pt"))
+    data = load_data(params)
+
+    result_per_patient_or_image = []
+    for patches, label in tqdm.tqdm(data, ncols=50):
         tfeat = torch.stack(list(map(torch.load, patches))).to(device=device)
             
         with torch.no_grad():
@@ -161,18 +195,17 @@ def main(params):
         y_pred = torch.mean(allSlide_pred_softmax, dim=0).to('cpu').numpy()
         
         # duplicate patient label to all samples
-        true_idx = slide_class_idx[labels[int(p)]]
-        y_true = np.zeros(len(slide_class_idx), dtype='int32')
-        y_true[true_idx] = 1
+        y_true = np.zeros(len(TRAIN_PARAMS['class_to_label'][params.dataset]), dtype='int32')
+        y_true[label] = 1
         
         # add to dict
-        result_per_patient[p] = (y_true, y_pred)
+        result_per_patient_or_image.append((y_true, y_pred))
     
     # calculates metrics across patches
-    y_true, y_pred = zip(*result_per_patient.values())
+    y_true, y_pred = zip(*result_per_patient_or_image)
     y_true = np.stack(y_true)
     y_pred = np.stack(y_pred)
-    patches_metrics = metrics_fn(y_true, y_pred, slide_class_idx)
+    patches_metrics = metrics_fn(params, y_true, y_pred)
     
     df = pandas.DataFrame([patches_metrics])
     
@@ -183,33 +216,45 @@ def main(params):
     df.to_csv(params.output, sep=';')
 
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--gpu', required=True, type=str)
-parser.add_argument('--labels', required=True, type=str)
-parser.add_argument('--model_dir', required=True, type=str, help='path to model weights directory')
-parser.add_argument('--output', required=True, type=str, help='path to the CSV file to save results')
-parser.add_argument('--num_cls', required=True, type=int)
-parser.add_argument('--mDATA_dir_test0', required=True, type=str)         ## Test Set
-parser.add_argument('--numGroup', default=4, type=int)
-parser.add_argument('--total_instance', default=4, type=int)
-parser.add_argument('--mDim', default=512, type=int)
-parser.add_argument('--numLayer_Res', default=0, type=int)
-parser.add_argument('--droprate', default='0', type=float)
-parser.add_argument('--droprate_2', default='0', type=float)
-parser.add_argument('--num_MeanInference', default=1, type=int)
-parser.add_argument('--distill_type', default='AFS', type=str)   ## MaxMinS, MaxS, AFS
-params = parser.parse_args()
-
-os.environ["CUDA_VISIBLE_DEVICES"] = params.gpu
-
-torch.autograd.set_detect_anomaly(True)
-
-torch.manual_seed(32)
-torch.cuda.manual_seed(32)
-np.random.seed(32)
-random.seed(32)
-
-slide_class_idx = {'ABC': 1, 'GCB': 0}
-
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, required=True, choices=["chulille", "dlbclmorph", "bci"])
+    parser.add_argument('--labels', required=True, type=str)
+    parser.add_argument('--model_dir', required=True, type=str, help='path to model weights directory')
+    parser.add_argument('--fold', type=str, default=None, help='fold to use as test')
+    parser.add_argument('--output', required=True, type=str, help='path to the CSV file to save results')
+    parser.add_argument('--gpu', required=True, type=str)
+    parser.add_argument('--num_cls', required=True, type=int)
+    parser.add_argument('--mDATA_dir_test0', required=True, type=str)         ## Test Set
+    parser.add_argument('--numGroup', default=4, type=int)
+    parser.add_argument('--total_instance', default=4, type=int)
+    parser.add_argument('--mDim', default=512, type=int)
+    parser.add_argument('--numLayer_Res', default=0, type=int)
+    parser.add_argument('--droprate', default='0', type=float)
+    parser.add_argument('--droprate_2', default='0', type=float)
+    parser.add_argument('--num_MeanInference', default=1, type=int)
+    parser.add_argument('--distill_type', default='AFS', type=str)   ## MaxMinS, MaxS, AFS
+    params = parser.parse_args()
+
+    global TRAIN_PARAMS
+    TRAIN_PARAMS = dict(
+        # dictionnar to convert class name to label
+        class_to_label = {
+            "chulille": {'ABC': 1, 'GCB': 0},
+            "dlbclmorph": {'NGC': 1, 'GC': 0},
+            "bci": {'0': 0, '1+': 1, '2+': 2, '3+': 3},
+        },
+    )
+
+    params.num_cls = len(TRAIN_PARAMS["class_to_label"][params.dataset])
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = params.gpu
+
+    torch.autograd.set_detect_anomaly(True)
+
+    torch.manual_seed(32)
+    torch.cuda.manual_seed(32)
+    np.random.seed(32)
+    random.seed(32)
+
     main(params)
