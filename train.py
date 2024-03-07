@@ -6,24 +6,6 @@ import torch, torch.nn as nn
 from Model import DTFDMIL
 import utils, data_loaders
 
-def split_into_bags(x, numGroup):
-    sub_bags = []
-    if isinstance(x, torch.Tensor):
-        idx = list(range(x.shape[0]))
-        random.shuffle(idx)
-        index_chunk_list = np.array_split(np.array(idx), numGroup)
-        index_chunk_list = [sst.tolist() for sst in index_chunk_list]
-        for tindex in index_chunk_list:
-            subFeat_tensor = torch.index_select(x, dim=0, index=torch.LongTensor(tindex).to(device=x.device))
-            sub_bags.append(subFeat_tensor)
-    else:
-        x = {k: split_into_bags(v, numGroup) for k, v in x.items()}
-        sub_bags = []
-        for i in range(numGroup):
-            sub_bags.append({k: v[i] for k, v in x.items()})
-
-    return sub_bags
-
 def StudentLoss(pred_student, pred_teacher):
     """
     Loss function for knowledge distillation (handle soft and hard distillation)
@@ -67,7 +49,7 @@ def validation(args, model, validation_data):
         
         # load input and group into bags
         x = {k: torch.stack(list(map(torch.load, v)), dim=0).to(device=device) for k, v in x.items()}
-        x = split_into_bags(x, args.numGroup)
+        x = utils.split_into_bags(x, args.numGroup)
         
         with torch.no_grad():
             if args.stain == "mono":
@@ -106,7 +88,7 @@ def train_step(args, batch, model, teacher=None):
 
     # load input and group into bags
     x = {k: torch.stack(list(map(torch.load, v)), dim=0).to(device=device) for k, v in x.items()}
-    x = split_into_bags(x, args.numGroup)
+    x = utils.split_into_bags(x, args.numGroup)
 
     # forward
     if teacher is None:

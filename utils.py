@@ -1,3 +1,4 @@
+import random
 from sklearn.metrics import roc_auc_score, roc_curve
 import torch, torch.nn as nn
 import numpy as np
@@ -104,3 +105,21 @@ def smooth_cross_entropy(pred, targets, p=0.0, n_classes=None):
         return torch.mean(cce_loss)
     else:
         return nn.functional.cross_entropy(pred, targets.to(dtype=torch.long))
+
+def split_into_bags(x, numGroup):
+    sub_bags = []
+    if isinstance(x, torch.Tensor):
+        idx = list(range(x.shape[0]))
+        random.shuffle(idx)
+        index_chunk_list = np.array_split(np.array(idx), numGroup)
+        index_chunk_list = [sst.tolist() for sst in index_chunk_list]
+        for tindex in index_chunk_list:
+            subFeat_tensor = torch.index_select(x, dim=0, index=torch.LongTensor(tindex).to(device=x.device))
+            sub_bags.append(subFeat_tensor)
+    else:
+        x = {k: split_into_bags(v, numGroup) for k, v in x.items()}
+        sub_bags = []
+        for i in range(numGroup):
+            sub_bags.append({k: v[i] for k, v in x.items()})
+
+    return sub_bags
