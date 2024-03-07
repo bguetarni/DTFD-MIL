@@ -1,7 +1,5 @@
-import os
 import torch
 import torch.nn as nn
-
 
 class Classifier_1fc(nn.Module):
     def __init__(self, n_channels, n_classes, droprate=0.0):
@@ -47,7 +45,6 @@ class DimReduction(nn.Module):
         self.resBlocks = nn.Sequential(*self.resBlocks)
 
     def forward(self, x):
-
         x = self.fc1(x)
         x = self.relu1(x)
 
@@ -55,7 +52,3 @@ class DimReduction(nn.Module):
             x = self.resBlocks(x)
 
         return x
-
-
-
-
