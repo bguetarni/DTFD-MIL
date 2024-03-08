@@ -412,8 +412,13 @@ def main(args):
             teacher = dict(classifier=classifier, attention=attention, dimReduction=dimReduction, attCls=attCls, stainfusion=stainfusion)
             teacher = torch.nn.ModuleDict(teacher)
             state_dict = torch.load(os.path.join(args.teacher, "ckpt.pth"), map_location=torch.device('cpu'))
-            teacher.load_state_dict(state_dict, strict=False)
+            teacher.load_state_dict(state_dict)
             teacher = teacher.eval().to(device=device)
+    
+    if not args.load_init_params is None:
+        print('loading initial params')
+        base_state_dict = torch.load(args.load_init_params, map_location=torch.device('cpu'))
+        model.load_state_dict(base_state_dict)
 
     model_path = os.path.join(args.output, args.name)
     os.makedirs(model_path, exist_ok=True)
@@ -496,6 +501,7 @@ if __name__ == "__main__":
     parser.add_argument('--fold', type=str, default=None, help='fold to use as test')
     parser.add_argument('--name', required=True, type=str)
     parser.add_argument('--gpu', required=True, type=str)
+    parser.add_argument('--load_init_params', type=str, default=None, help='path to base initial parmeters')
 
     parser.add_argument('--EPOCH', default=200, type=int)
     parser.add_argument('--epoch_step', default='[100]', type=str)
