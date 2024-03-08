@@ -10,8 +10,7 @@ import torch
 import torchvision.transforms as T
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-from Model.Attention import Attention_Gated as Attention
-from Model.Attention import Attention_with_Classifier
+from Model.Attention import Attention_with_Classifier, Attention_Gated
 from utils import get_cam_1d
 from Model.network import    Classifier_1fc, DimReduction
 from utils import eval_metric
@@ -78,7 +77,6 @@ def metrics_fn(args, Y_true, Y_pred):
     return metrics_
 
 
-
 def load_data(args):
 
     if args.dataset in ["chulille", "dlbclmorph"]:
@@ -86,68 +84,64 @@ def load_data(args):
 
     data = []
     if args.dataset == "chulille":
-        pass #TODO
+        raise RuntimeError("dataset chulille not implemented yet")
     elif  args.dataset == "dlbclmorph":
         for fold in os.listdir(args.mDATA_dir_test0):
             if fold != args.fold:
-                continue
-            for p in os.listdir(os.path.join(args.mDATA_dir_test0, fold)):
-                y = labels[int(p)]
-                patches = glob.glob(os.path.join(args.mDATA_dir_test0, fold, p, '*.pt'))
-                data.append((patches, TRAIN_PARAMS['class_to_label'][args.dataset][y]))
+                for p in os.listdir(os.path.join(args.mDATA_dir_test0, fold)):
+                    y = labels[int(p)]
+                    patches = {stain: glob.glob(os.path.join(args.mDATA_dir_test0, fold, p, stain, '*.pt')) for stain in TRAIN_PARAMS['STAINS'][args.dataset]}
+                    data.append((patches, TRAIN_PARAMS['class_to_label'][args.dataset][y]))
     elif  args.dataset == "bci":
-        for img_name in os.listdir(os.path.join(args.mDATA_dir_test0, "test")):
+        for img_name in os.listdir(os.path.join(args.mDATA_dir_test0, "train")):
             y = img_name.split('_')[-1]
-            patches = glob.glob(os.path.join(args.mDATA_dir_test0, "test", img_name, '*.pt'))
+            patches = {stain: glob.glob(os.path.join(args.mDATA_dir_test0, "train", img_name, stain, '*.pt')) for stain in TRAIN_PARAMS['STAINS'][args.dataset]}
             data.append((patches, TRAIN_PARAMS['class_to_label'][args.dataset][y]))
     
     return data
 
 
-def main(params):
+def main(args):
+    global device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if params.dataset in ["chulille", "dlbclmorph"]:
-        labels = pandas.read_csv(params.labels).set_index('patient_id')['label'].to_dict()
+    # get model name
+    model_name = os.path.split(args.model_dir)[1]
+    print('testing model {} on dataset {}'.format(model_name, args.dataset))
+    output_dir = os.path.join(args.output, model_name)
+    os.makedirs(output_dir, exist_ok=True)
 
     # model
     in_chn = 1024
-    classifier = Classifier_1fc(params.mDim, params.num_cls, params.droprate).to(device=device)
-    attention = Attention(params.mDim).to(device=device)
-    dimReduction = DimReduction(in_chn, params.mDim, numLayer_Res=params.numLayer_Res).to(device=device)
-    attCls = Attention_with_Classifier(L=params.mDim, num_cls=params.num_cls, droprate=params.droprate_2).to(device=device)
+    classifier = Classifier_1fc(args.mDim, args.num_cls, args.droprate)
+    attention = Attention_Gated(args.mDim)
+    dimReduction = DimReduction(in_chn, args.mDim, numLayer_Res=args.numLayer_Res)
+    attCls = Attention_with_Classifier(stains=None, L=args.mDim, num_cls=args.num_cls, droprate=args.droprate_2)
+    model = dict(classifier=classifier, attention=attention, dimReduction=dimReduction, attCls=attCls)
+    model = torch.nn.ModuleDict(model).eval().to(device=device)
+    state_dict = torch.load(os.path.join(args.model_dir, "ckpt.pth"), map_location=torch.device('cpu'))
+    model.load_state_dict(state_dict, strict=False)
 
-    state_dict = torch.load(os.path.join(params.model_dir, 'best_model.pth'), map_location='cpu')
-    classifier.load_state_dict(state_dict['classifier'])
-    attention.load_state_dict(state_dict['attention'])
-    dimReduction.load_state_dict(state_dict['dim_reduction'])
-    attCls.load_state_dict(state_dict['att_classifier'])
-    
-    classifier.eval()
-    attention.eval()
-    dimReduction.eval()
-    attCls.eval()
+    instance_per_group = args.total_instance // args.numGroup
 
-    instance_per_group = params.total_instance // params.numGroup
-
-    data = load_data(params)
+    data = load_data(args)
 
     result_per_patient_or_image = []
     for patches, label in tqdm.tqdm(data, ncols=50):
+        patches = patches[TRAIN_PARAMS['STAINS'][args.dataset][0]]
         tfeat = torch.stack(list(map(torch.load, patches))).to(device=device)
             
         with torch.no_grad():
-            midFeat = dimReduction(tfeat)
 
-            AA = attention(midFeat, isNorm=False).squeeze(0)  ## N
+            midFeat = model["dimReduction"](tfeat)
+            AA = model["attention"](midFeat, isNorm=False).squeeze(0)  ## N
 
             allSlide_pred_softmax = []
-
-            for jj in range(params.num_MeanInference):
+            for jj in range(args.num_MeanInference):
 
                 feat_index = list(range(tfeat.shape[0]))
                 random.shuffle(feat_index)
-                index_chunk_list = np.array_split(np.array(feat_index), params.numGroup)
+                index_chunk_list = np.array_split(np.array(feat_index), args.numGroup)
                 index_chunk_list = [sst.tolist() for sst in index_chunk_list]
 
                 slide_d_feat = []
@@ -171,31 +165,31 @@ def main(params):
 
                     # _, sort_idx = torch.sort(patch_pred_softmax[:, -1], descending=True)
 
-                    # if params.distill_type == 'MaxMinS':
+                    # if args.distill_type == 'MaxMinS':
                     #     topk_idx_max = sort_idx[:instance_per_group].long()
                     #     topk_idx_min = sort_idx[-instance_per_group:].long()
                     #     topk_idx = torch.cat([topk_idx_max, topk_idx_min], dim=0)
                     #     d_inst_feat = tmidFeat.index_select(dim=0, index=topk_idx)
                     #     slide_d_feat.append(d_inst_feat)
-                    # elif params.distill_type == 'MaxS':
+                    # elif args.distill_type == 'MaxS':
                     #     topk_idx_max = sort_idx[:instance_per_group].long()
                     #     topk_idx = topk_idx_max
                     #     d_inst_feat = tmidFeat.index_select(dim=0, index=topk_idx)
                     #     slide_d_feat.append(d_inst_feat)
-                    # elif params.distill_type == 'AFS':
+                    # elif args.distill_type == 'AFS':
                     #     slide_d_feat.append(tattFeat_tensor)
 
                     slide_d_feat.append(tattFeat_tensor)
 
                 slide_d_feat = torch.cat(slide_d_feat, dim=0)
-                gSlidePred = attCls(slide_d_feat)
+                gSlidePred = model["attCls"](slide_d_feat)
                 allSlide_pred_softmax.append(torch.softmax(gSlidePred, dim=1))
 
         allSlide_pred_softmax = torch.cat(allSlide_pred_softmax, dim=0)
         y_pred = torch.mean(allSlide_pred_softmax, dim=0).to('cpu').numpy()
         
         # duplicate patient label to all samples
-        y_true = np.zeros(len(TRAIN_PARAMS['class_to_label'][params.dataset]), dtype='int32')
+        y_true = np.zeros(len(TRAIN_PARAMS['class_to_label'][args.dataset]), dtype='int32')
         y_true[label] = 1
         
         # add to dict
@@ -205,7 +199,7 @@ def main(params):
     y_true, y_pred = zip(*result_per_patient_or_image)
     y_true = np.stack(y_true)
     y_pred = np.stack(y_pred)
-    patches_metrics = metrics_fn(params, y_true, y_pred)
+    patches_metrics = metrics_fn(args, y_true, y_pred)
     
     df = pandas.DataFrame([patches_metrics])
     
@@ -213,19 +207,20 @@ def main(params):
     df = df.round(decimals=2)
 
     # save results in a CSV file
-    df.to_csv(params.output, sep=';')
+    df.to_csv(os.path.join(output_dir, "metrics.csv"), sep=';')
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, required=True, choices=["chulille", "dlbclmorph", "bci"])
-    parser.add_argument('--labels', required=True, type=str)
+    parser.add_argument('--mDATA_dir_test0', required=True, type=str)         ## Test Set
     parser.add_argument('--model_dir', required=True, type=str, help='path to model weights directory')
+    parser.add_argument('--labels', required=True, type=str)
     parser.add_argument('--fold', type=str, default=None, help='fold to use as test')
     parser.add_argument('--output', required=True, type=str, help='path to the CSV file to save results')
     parser.add_argument('--gpu', required=True, type=str)
     parser.add_argument('--num_cls', required=True, type=int)
-    parser.add_argument('--mDATA_dir_test0', required=True, type=str)         ## Test Set
+
     parser.add_argument('--numGroup', default=4, type=int)
     parser.add_argument('--total_instance', default=4, type=int)
     parser.add_argument('--mDim', default=512, type=int)
@@ -234,10 +229,18 @@ if __name__ == "__main__":
     parser.add_argument('--droprate_2', default='0', type=float)
     parser.add_argument('--num_MeanInference', default=1, type=int)
     parser.add_argument('--distill_type', default='AFS', type=str)   ## MaxMinS, MaxS, AFS
-    params = parser.parse_args()
+    args = parser.parse_args()
 
     global TRAIN_PARAMS
     TRAIN_PARAMS = dict(
+
+        # stains of each dataset
+        STAINS = {
+            "chulille": ['HES', 'BCL6', 'CD10', 'MUM1'],
+            "dlbclmorph": ['HE', 'BCL6', 'CD10', 'MUM1'],
+            "bci": ['HES', 'IHC'],
+        },
+
         # dictionnar to convert class name to label
         class_to_label = {
             "chulille": {'ABC': 1, 'GCB': 0},
@@ -246,9 +249,9 @@ if __name__ == "__main__":
         },
     )
 
-    params.num_cls = len(TRAIN_PARAMS["class_to_label"][params.dataset])
+    args.num_cls = len(TRAIN_PARAMS["class_to_label"][args.dataset])
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = params.gpu
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
     torch.autograd.set_detect_anomaly(True)
 
@@ -257,4 +260,4 @@ if __name__ == "__main__":
     np.random.seed(32)
     random.seed(32)
 
-    main(params)
+    main(args)
