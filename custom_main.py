@@ -1,4 +1,4 @@
-import argparse, json, os, glob, random
+import argparse, json, os, glob, random, re
 import pandas
 import numpy as np
 import tqdm
@@ -105,7 +105,13 @@ def load_data(args, validation_factor=0.2):
 
     data = []
     if args.dataset == "chulille":
-        raise RuntimeError("dataset chulille not implemented yet")
+        print('WARNING: for dataset chulille, only HES stain available yet !')
+        for fold in os.listdir(args.mDATA0_dir_train0):
+            if fold != args.fold:
+                for slide in os.listdir(os.path.join(args.mDATA0_dir_train0, fold)):
+                    y = labels[int(re.findall('\d+', slide)[0])]
+                    patches = {stain: glob.glob(os.path.join(args.mDATA0_dir_train0, fold, slide, '*.pt')) for stain in TRAIN_PARAMS['STAINS'][args.dataset][:1]}
+                    data.append((patches, TRAIN_PARAMS['class_to_label'][args.dataset][y]))
     elif  args.dataset == "dlbclmorph":
         for fold in os.listdir(args.mDATA0_dir_train0):
             if fold != args.fold:

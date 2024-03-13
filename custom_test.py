@@ -1,19 +1,14 @@
-import argparse, json, os, glob, math, pickle, random
+import argparse, os, glob, random, re
 import pandas
 import numpy as np
 import tqdm
-import sklearn
+from sklearn import metrics as sklearn_metrics
 
-from torch.utils.tensorboard import SummaryWriter
-import torch.nn.functional as F
 import torch
-import torchvision.transforms as T
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 from Model.Attention import Attention_with_Classifier, Attention_Gated
-from utils import get_cam_1d
 from Model.network import    Classifier_1fc, DimReduction
-from utils import eval_metric
 
 def metrics_fn(args, Y_true, Y_pred):
     """
@@ -23,7 +18,7 @@ def metrics_fn(args, Y_true, Y_pred):
     """
 
     # cross-entropy error
-    error = sklearn.metrics.log_loss(Y_true, Y_pred)
+    error = sklearn_metrics.log_loss(Y_true, Y_pred)
 
     # ROC AUC (per class)
     auc = dict()
@@ -34,7 +29,7 @@ def metrics_fn(args, Y_true, Y_pred):
         # transform probabilities from [0.5,1] to [0,1]
         # probabilities in [0,0.5] are clipped to 0
         ypred = np.clip(Y_pred[:,i], 0.5, 1) * 2 - 1
-        auc_score = sklearn.metrics.roc_auc_score(ytrue, ypred)
+        auc_score = sklearn_metrics.roc_auc_score(ytrue, ypred)
         auc.update({i: auc_score})
     
     # convert to one-hot index
@@ -42,17 +37,17 @@ def metrics_fn(args, Y_true, Y_pred):
     Y_pred_label = np.argmax(Y_pred, axis=-1)
     
     # global metrics
-    TP = sklearn.metrics.accuracy_score(Y_true_label, Y_pred_label, normalize=False)
-    accuracy = sklearn.metrics.accuracy_score(Y_true_label, Y_pred_label)
-    micro_Fscore = sklearn.metrics.f1_score(Y_true_label, Y_pred_label, average='micro')
-    macro_Fscore = sklearn.metrics.f1_score(Y_true_label, Y_pred_label, average='macro')
-    weighted_Fscore = sklearn.metrics.f1_score(Y_true_label, Y_pred_label, average='weighted')
+    TP = sklearn_metrics.accuracy_score(Y_true_label, Y_pred_label, normalize=False)
+    accuracy = sklearn_metrics.accuracy_score(Y_true_label, Y_pred_label)
+    micro_Fscore = sklearn_metrics.f1_score(Y_true_label, Y_pred_label, average='micro')
+    macro_Fscore = sklearn_metrics.f1_score(Y_true_label, Y_pred_label, average='macro')
+    weighted_Fscore = sklearn_metrics.f1_score(Y_true_label, Y_pred_label, average='weighted')
 
     # compile metrics in dict
     metrics_ = dict(error=error, TP=TP, accuracy=accuracy, micro_Fscore=micro_Fscore, macro_Fscore=macro_Fscore, weighted_Fscore=weighted_Fscore)
     
     # confusion matrix for each class
-    multiclass_cm = sklearn.metrics.multilabel_confusion_matrix(Y_true_label, Y_pred_label)
+    multiclass_cm = sklearn_metrics.multilabel_confusion_matrix(Y_true_label, Y_pred_label)
 
     # computes binary metrics for each class (one versus all)
     for k, i in TRAIN_PARAMS['class_to_label'][args.dataset].items():
@@ -84,18 +79,24 @@ def load_data(args):
 
     data = []
     if args.dataset == "chulille":
-        raise RuntimeError("dataset chulille not implemented yet")
+        print('WARNING: for dataset chulille, only HES stain available yet !')
+        for fold in os.listdir(args.mDATA_dir_test0):
+            if fold == args.fold:
+                for slide in os.listdir(os.path.join(args.mDATA_dir_test0, fold)):
+                    y = labels[int(re.findall('\d+', slide)[0])]
+                    patches = {stain: glob.glob(os.path.join(args.mDATA_dir_test0, fold, slide, '*.pt')) for stain in TRAIN_PARAMS['STAINS'][args.dataset][:1]}
+                    data.append((patches, TRAIN_PARAMS['class_to_label'][args.dataset][y]))
     elif  args.dataset == "dlbclmorph":
         for fold in os.listdir(args.mDATA_dir_test0):
-            if fold != args.fold:
+            if fold == args.fold:
                 for p in os.listdir(os.path.join(args.mDATA_dir_test0, fold)):
                     y = labels[int(p)]
                     patches = {stain: glob.glob(os.path.join(args.mDATA_dir_test0, fold, p, stain, '*.pt')) for stain in TRAIN_PARAMS['STAINS'][args.dataset]}
                     data.append((patches, TRAIN_PARAMS['class_to_label'][args.dataset][y]))
     elif  args.dataset == "bci":
-        for img_name in os.listdir(os.path.join(args.mDATA_dir_test0, "train")):
+        for img_name in os.listdir(os.path.join(args.mDATA_dir_test0, "test")):
             y = img_name.split('_')[-1]
-            patches = {stain: glob.glob(os.path.join(args.mDATA_dir_test0, "train", img_name, stain, '*.pt')) for stain in TRAIN_PARAMS['STAINS'][args.dataset]}
+            patches = {stain: glob.glob(os.path.join(args.mDATA_dir_test0, "test", img_name, stain, '*.pt')) for stain in TRAIN_PARAMS['STAINS'][args.dataset]}
             data.append((patches, TRAIN_PARAMS['class_to_label'][args.dataset][y]))
     
     return data
@@ -215,7 +216,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', type=str, required=True, choices=["chulille", "dlbclmorph", "bci"])
     parser.add_argument('--mDATA_dir_test0', required=True, type=str)         ## Test Set
     parser.add_argument('--model_dir', required=True, type=str, help='path to model weights directory')
-    parser.add_argument('--labels', required=True, type=str)
+    parser.add_argument('--labels', default=None, type=str)
     parser.add_argument('--fold', type=str, default=None, help='fold to use as test')
     parser.add_argument('--output', required=True, type=str, help='path to the CSV file to save results')
     parser.add_argument('--gpu', required=True, type=str)
